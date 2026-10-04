@@ -15,6 +15,11 @@ Run once, with AWS credentials for the target account active:
 This creates a bucket named `remote-state-<aws-account-id>` (e.g.
 `remote-state-431071856068`) and prints its name at the end.
 
+The bucket is **versioned**, so a corrupted or truncated state write can be
+rolled back by restoring the previous version of that object. Old versions
+expire after 30 days, and delete markers with nothing behind them are
+removed, so versioning does not make the bucket grow without bound.
+
 ### How `deploy.sh` avoids the chicken-and-egg problem
 
 This project's own state needs to live in the bucket it creates, same as
