@@ -1,112 +1,63 @@
 # mootmaker-bootstrap-terraform
 
-Creates the shared S3 bucket that the other `mootmaker-*` projects use as
-Terraform remote state storage, so state isn't kept only on one person's
-laptop and everyone applying Terraform reads/writes the same state.
+Creates the one S3 bucket every other repository keeps its Terraform state in:
+`remote-state-<account-id>` (`remote-state-431071856068`) in the workload account. Run it once per
+account. Everything else here exists to make that safe.
 
-## First-time setup
+## The bucket
 
-Run once, with AWS credentials for the target account active:
+| Setting | Why |
+|---|---|
+| `prevent_destroy` | A stray `terraform destroy` here would take every project's state with it. To decommission the bucket on purpose, remove the lifecycle block first |
+| Public access blocked, AES256 encryption | State can contain resource details nobody outside the account should read |
+| Versioning | A corrupted or truncated write to any project's state can be rolled back to the previous version. Without it, every resource that state tracked would be orphaned |
+| Old versions expire after 30 days; empty delete markers are removed | Every ephemeral environment and release writes state several times, so unbounded versions would grow with time rather than use. 30 days is long enough to notice a bad write |
+| No DynamoDB lock table | Locking uses Terraform's native S3 lockfile (`use_lockfile = true`, Terraform 1.10 or later). A second `apply` on the same key waits or fails until the first finishes |
 
+## How the state is laid out
+
+```mermaid
+flowchart LR
+  bucket[("remote-state-431071856068")]
+  bucket --> bootstrap["bootstrap/<br/>this repository"]
+  bucket --> domain["domain/<br/>mootmaker-domain"]
+  bucket --> email["mootmaker-e2e-email/<br/>mootmaker-email-testing"]
+  bucket --> release["release/<br/>mootmaker-release's log group"]
+  bucket --> envs["&lt;environment&gt;/&lt;project&gt;/<br/>production/mootmaker-api/, test/mootmaker-webapp/,<br/>claude-261012-x7q2/mootmaker-demo-data/, …"]
 ```
+
+Each repository's `deploy/terraform/` has an empty `backend "s3" {}` block in `versions.tf` and a committed
+`backend.hcl` with the bucket, region and `use_lockfile`. It is not secret. A per-environment repository's
+`deploy.sh` adds the key at init time:
+
+```bash
+terraform init -backend-config=backend.hcl -backend-config="key=<environment>/<project>/terraform.tfstate"
+```
+
+A one-deployment repository (domain, email-testing, release, this one) puts a fixed `key` in its
+`backend.hcl` instead. The ephemeral-environment scripts find environments by listing the first path
+segment, so a fixed key that does not look like `<kind>-<YYMMDD>-<rand4>` is never mistaken for one. A
+new project needs only its own `<project>` segment.
+
+## Deploying
+
+```bash
 ./deploy.sh
 ```
 
-This creates a bucket named `remote-state-<aws-account-id>` (e.g.
-`remote-state-431071856068`) and prints its name at the end.
+Run it deliberately, with credentials for the target account. Never run it from automation.
 
-The bucket is **versioned**, so a corrupted or truncated state write can be
-rolled back by restoring the previous version of that object. Old versions
-expire after 30 days, and delete markers with nothing behind them are
-removed, so versioning does not make the bucket grow without bound.
+**The first run has to create the bucket its own state lives in.** If the bucket does not exist yet, the
+S3 backend cannot initialise. `deploy.sh` handles this:
 
-### How `deploy.sh` avoids the chicken-and-egg problem
+1. It tries `terraform init` against the S3 backend. If that fails, it removes the `backend "s3"` block
+   for the moment and initialises with local state.
+2. It applies, creating the bucket.
+3. It restores the block, even if the apply failed, and initialises again with `-migrate-state`. This
+   copies the local state into the bucket under `bootstrap/terraform.tfstate`.
 
-This project's own state needs to live in the bucket it creates, same as
-every other project — but on the very first run, that bucket doesn't exist
-yet, so Terraform can't initialise an S3 backend pointed at it. `deploy.sh`
-handles this in three steps:
+On every later run both inits reconnect to the remote state, and `deploy.sh` behaves like any other.
+After the first run a stale local `terraform.tfstate` is left behind. It is git-ignored and can be deleted.
 
-1. It first tries `terraform init -backend-config=backend.hcl -migrate-state
-   -force-copy`. On a fresh checkout this fails (the bucket doesn't exist),
-   so it falls back to a plain local `terraform init`.
-2. `terraform apply` runs against that local state, creating the bucket.
-3. It runs the backend-config init again. The bucket now exists, so this
-   succeeds and copies the local state into it, under the key
-   `bootstrap/terraform.tfstate` in the same bucket every other project uses.
-
-From then on, `deploy.sh` is idempotent: both init attempts just reconnect to
-the already-migrated remote state, so re-running it behaves like any other
-project's `deploy.sh`.
-
-We deliberately did **not** commit `terraform.tfstate` to git as a way around
-this. It would have worked, but state files are merge-hostile, and while
-today's state (an S3 bucket and its access/encryption settings) has nothing
-secret in it, that stops being true the moment this project grows — and
-committing it would leave this one project without the locking that
-`use_lockfile` gives everything else. Migrating into the bucket keeps this
-project consistent with the rest instead of a special case.
-
-A leftover local `deploy/terraform/terraform.tfstate` file remains after the
-migration (Terraform doesn't delete the source state) — it's stale, is
-already covered by `.gitignore`, and can be deleted or left alone.
-
-The bucket has `prevent_destroy` set, so a stray `terraform destroy` here
-can't take out every project's state in one go. To genuinely decommission
-it, remove that lifecycle block first.
-
-## Configuring other projects to use remote state
-
-Each `mootmaker-*` project's `deploy/terraform/` directory has:
-
-- A `backend "s3" {}` block (empty) in `versions.tf`, declaring that the
-  project uses an S3 backend without hardcoding the details.
-- A checked-in `backend.hcl` file supplying the parts that don't change per
-  deploy:
-
-  ```hcl
-  bucket       = "remote-state-431071856068"
-  region       = "us-east-1"
-  use_lockfile = true
-  ```
-
-- Scripts (`deploy.sh`, `undeploy.sh`, `authenticate.sh`) that pass `key`
-  on the command line instead, computed from the **environment** being
-  deployed (see the [mootmaker project README](https://github.com/geoffweatherall/mootmaker#multi-environment-deployments)
-  for the full multi-environment design):
-
-  ```
-  terraform init -backend-config=backend.hcl -backend-config="key=<environment>/<project-name>/terraform.tfstate"
-  ```
-
-  giving a layout like `test/room-booking-api/terraform.tfstate`,
-  `production/room-booking-webapp/terraform.tfstate`, or
-  `bob/room-booking-api/terraform.tfstate` for a developer's personal sandbox.
-
-`backend.hcl` isn't secret — it just says which bucket to read and write
-state from — so it's committed to git rather than ignored.
-
-If the state bucket ever changes (e.g. a new AWS account), update the
-`bucket` value in each project's `backend.hcl` and re-run `terraform init`
-with the same `-backend-config` flags plus `-reconfigure`.
-
-### Adding a new project
-
-Give it its own `<project-name>` segment in the `key` passed by its scripts
-(e.g. `<environment>/<project-name>/terraform.tfstate`) so its state doesn't
-collide with another project's in the shared bucket.
-
-## Locking
-
-State locking uses Terraform's native S3 lockfile support (`use_lockfile =
-true`), not a DynamoDB table. This requires Terraform >= 1.10 (all projects'
-`versions.tf` require this). When two people (or the same person twice)
-attempt `apply` against the same state key concurrently, the second one
-blocks/fails until the first finishes.
-
-## Why no bucket versioning
-
-Versioning was deliberately left off to keep this simple/cheap. This means
-there's no built-in way to recover a previous version of the state file if
-it's overwritten or corrupted — if that risk matters later, versioning can be
-turned on by adding an `aws_s3_bucket_versioning` resource in `s3.tf`.
+If the bucket ever changes (a new account), update `bucket` in every repository's `backend.hcl`, then
+`terraform init -reconfigure` with the same flags.
