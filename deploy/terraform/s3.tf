@@ -30,9 +30,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "remote_state" {
   }
 }
 
-# Versioning, so a corrupted or truncated state write has a recovery path (found while checking
-# mootmaker#77). Without it, a bad write to any project's state is unrecoverable, and every resource
-# that state tracked is orphaned.
+# Versioning, so a corrupted or truncated state write has a recovery path (mootmaker#77). Without
+# it, a bad write to any project's state is unrecoverable, and every resource that state tracked is
+# orphaned.
 resource "aws_s3_bucket_versioning" "remote_state" {
   bucket = aws_s3_bucket.remote_state.id
 
